@@ -1,0 +1,625 @@
+import os, re, math
+import aiosqlite
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional
+
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
+)
+from telegram.constants import ParseMode, ChatType
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, filters
+)
+
+# ---------------- ENV ----------------
+BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
+GROUP_ID    = os.getenv("GROUP_ID")          # e.g. -4942161299 (your group)
+CHANNEL_ID  = os.getenv("CHANNEL_ID")        # e.g. @YourChannel or -100xxxxxxxx (optional)
+ADMIN_USER  = int(os.getenv("ADMIN_USER_ID", "0"))
+
+DB_PATH = "listings.db"
+
+# ---------------- Wizard states ----------------
+(
+    C_LANG, C_DEAL, C_TYPE, C_DISTRICT, C_PRICE, C_SIZE, C_BEDS, C_BATHS,
+    C_DESC, C_CONTACT, C_LICENSE, C_LOCATION, C_PHOTOS
+) = range(13)
+
+# ---------------- Riyadh geo + rules ----------------
+RIYADH_CENTER = (24.7136, 46.6753)
+RIYADH_RADIUS_KM = 70.0
+
+OFFTOPIC_KEYWORDS = {
+    "loan","loans","تمويل","تقسيط","قرض","قروض","تأمين","insurance","نقل عفش","نقل أثاث",
+    "moving","furniture moving","كهربائي","سباك","تنظيف","cleaning","دهان","صيانة",
+    "translation service","ترجمة خدمات","دورات","courses","تصميم مواقع","web design"
+}
+NON_RIYADH_CITIES = {
+    "جدة","مكة","المدينة","الخبر","الدمام","الظهران","ينبع","تبوك","حائل","جازان",
+    "أبها","نجران","الطائف","عرعر","القصيم","بريدة","الهفوف","القطيف",
+    "jeddah","mecca","makkah","madinah","medina","khobar","dammam","dhahran",
+    "yanbu","tabuk","hail","jazan","abha","najran","taif","arar","qassim","buraidah","hofuf","qatif"
+}
+LICENSE_PATTERN = re.compile(r"(?:FAL|فال|رخصة|ترخيص)\s*[:\-]?\s*(\d{7,12})", re.IGNORECASE)
+
+# ---------------- Text ----------------
+TXT = {
+    "start": "مرحبًا! 👋\nبوت عقارات الرياض للوكلاء.\n/new لإضافة عقار، /search للبحث.\n\nHi! Use /new to submit a property, /search to find.",
+    "choose_lang": "اختر اللغة / Choose language:",
+    "deal": {"ar":"نوع العرض؟ اختر:", "en":"Deal type? Choose:"},
+    "deal_btns": [("بيع • Sale","sale"),("إيجار • Rent","rent")],
+    "type": {"ar":"نوع العقار؟ (شقة/فيلا/أرض/مكتب...)", "en":"Property type? (apartment/villa/land/office...)"},
+    "district": {"ar":"الحي داخل الرياض؟", "en":"District/Area in Riyadh?"},
+    "price": {"ar":"السعر (ريال):", "en":"Price (SAR):"},
+    "size": {"ar":"المساحة (م²):", "en":"Size (m²):"},
+    "beds": {"ar":"عدد الغرف:", "en":"Bedrooms:"},
+    "baths": {"ar":"عدد الحمامات:", "en":"Bathrooms:"},
+    "desc": {"ar":"وصف مختصر:", "en":"Short description:"},
+    "contact": {"ar":"وسيلة التواصل (جوال/واتساب):", "en":"Contact (phone/WhatsApp):"},
+    "license": {"ar":"اكتب رقم الرخصة العقارية (FAL):", "en":"Enter your Real Estate License (FAL):"},
+    "license_invalid": {"ar":"رقم الرخصة غير صالح (٧–١٢ أرقام).", "en":"Invalid FAL (7–12 digits)."},
+    "location": {"ar":"أرسل الموقع (اختياري) أو اكتب 'تخطي'", "en":"Send a location pin (optional) or type 'skip'"},
+    "photos": {"ar":"أرسل 1–10 صور. اكتب 'تم' عند الانتهاء.", "en":"Send 1–10 photos. Type 'done' when finished."},
+    "submitted": {"ar":"تم الإرسال ✅ بانتظار الموافقة. رقم الطلب: #{id}", "en":"Submitted ✅ Waiting for review. ID: #{id}"},
+    "invalid": {"ar":"قيمة غير صحيحة، حاول مجددًا.", "en":"Invalid value, try again."},
+    "pending_none": {"ar":"لا توجد طلبات قيد المراجعة.", "en":"No pending listings."},
+    "only_admin": {"ar":"هذا الأمر للمشرف فقط.", "en":"Admins only."},
+    "approved_user": {"ar":"تمت الموافقة ونُشر إعلانك ✅", "en":"Approved & published ✅"},
+    "rejected_user": {"ar":"مرفوض ❌ سبب: {reason}", "en":"Rejected ❌ Reason: {reason}"},
+    "send_more_photos": {"ar":"تم حفظ الصورة ✅ أرسل المزيد أو اكتب 'تم'", "en":"Photo saved ✅ Send more or type 'done'"},
+    "search_intro": "اكتب هكذا:\n/search sale 300000-1500000 الملز\nFormat:\n/search rent 3000-8000 Olaya",
+    "saved_loc": {"ar":"تم حفظ الموقع ✅", "en":"Location saved ✅"},
+    "skipped_loc": {"ar":"تم التخطي.", "en":"Skipped."},
+}
+
+def t(lang: str, key: str) -> str:
+    v = TXT.get(key)
+    return v.get(lang, next(iter(v.values()))) if isinstance(v, dict) else v
+
+# ---------------- DB ----------------
+INIT_SQL = """
+CREATE TABLE IF NOT EXISTS listings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL,
+  language TEXT NOT NULL,
+  deal TEXT NOT NULL,
+  ptype TEXT NOT NULL,
+  district TEXT NOT NULL,
+  price INTEGER NOT NULL,
+  size INTEGER NOT NULL,
+  beds INTEGER NOT NULL,
+  baths INTEGER NOT NULL,
+  descr TEXT NOT NULL,
+  contact TEXT NOT NULL,
+  license_no TEXT NOT NULL,
+  lat REAL, lon REAL,
+  photo_file_ids TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+"""
+OFFENSES_SQL = """
+CREATE TABLE IF NOT EXISTS offenses (
+  user_id INTEGER PRIMARY KEY,
+  count INTEGER NOT NULL DEFAULT 0,
+  last_reason TEXT,
+  updated_at TEXT NOT NULL
+);
+"""
+
+async def db():
+    conn = await aiosqlite.connect(DB_PATH)
+    await conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+async def init_db():
+    async with await db() as conn:
+        await conn.execute(INIT_SQL)
+        await conn.execute(OFFENSES_SQL)
+        await conn.commit()
+
+# ---------------- Utils ----------------
+def parse_price_int(text: str) -> Optional[int]:
+    digits = re.sub(r"[^\d]", "", text or "")
+    return int(digits) if digits else None
+
+def parse_int(text: str) -> Optional[int]:
+    try: return int(text.strip())
+    except: return None
+
+def clean_digits(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
+
+def is_admin(uid: int) -> bool:
+    return uid == ADMIN_USER
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    R = 6371.0
+    import math as m
+    p1, p2 = m.radians(lat1), m.radians(lat2)
+    dphi, dlmb = m.radians(lat2-lat1), m.radians(lon2-lon1)
+    a = m.sin(dphi/2)**2 + m.cos(p1)*m.cos(p2)*m.sin(dlmb/2)**2
+    return 2*R*m.asin(m.sqrt(a))
+
+def looks_offtopic(text: str) -> bool:
+    if not text: return False
+    t = text.lower()
+    return any(k in t for k in (kw.lower() for kw in OFFTOPIC_KEYWORDS))
+
+def mentions_non_riyadh_city(text: str) -> bool:
+    if not text: return False
+    t = text.lower()
+    return any(city in t for city in (c.lower() for c in NON_RIYADH_CITIES))
+
+def contains_license(text: str) -> bool:
+    if not text: return False
+    return bool(LICENSE_PATTERN.search(text))
+
+def listing_caption(d: Dict[str, Any]) -> str:
+    lines = [
+        f"🏷️ {('للبيع' if d['deal']=='sale' else 'للإيجار')} • {d['ptype'].title()}",
+        f"📍 {d['district']} — الرياض",
+        f"💰 السعر: {d['price']:,} ر.س",
+        f"📐 المساحة: {d['size']:,} م²",
+        f"🛏️ غرف: {d['beds']} • 🛁 حمامات: {d['baths']}",
+        f"📝 {d['descr']}",
+        f"☎️ تواصل: {d['contact']}",
+        f"🔖 رخصة: {d['license_no']}",
+    ]
+    if d.get("lat") and d.get("lon"):
+        lines.append(f"📌 الموقع: https://maps.google.com/?q={d['lat']},{d['lon']}")
+    lines += [
+        "",
+        "—",
+        f"EN: {d['ptype'].title()} for {('Sale' if d['deal']=='sale' else 'Rent')} in Riyadh ({d['district']}). "
+        f"Price: SAR {d['price']:,}, Size: {d['size']} m², {d['beds']} BR / {d['baths']} BA. "
+        f"Contact: {d['contact']} • FAL: {d['license_no']}"
+    ]
+    return "\n".join(lines)
+
+def lang_keyboard():
+    btns = [
+        InlineKeyboardButton("العربية", callback_data="lang:ar"),
+        InlineKeyboardButton("English", callback_data="lang:en")
+    ]
+    return InlineKeyboardMarkup([btns])
+
+def deal_keyboard():
+    btns = [InlineKeyboardButton(text, callback_data=f"deal:{code}") for (text, code) in TXT["deal_btns"]]
+    return InlineKeyboardMarkup([btns])
+
+# ---------------- Commands ----------------
+async def cmd_whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await update.message.reply_text(f"Chat ID: {chat.id}\nType: {chat.type}\nTitle: {chat.title or ''}")
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(TXT["start"])
+
+async def cmd_pin_policy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None or not is_admin(update.effective_user.id):
+        await update.message.reply_text(TXT["only_admin"]); return
+    policy = (
+        "📌 **سياسة المجموعة/القناة**\n"
+        "• لصاحب الصفحة حق أتعاب ثابت قدره **1%** من قيمة الصفقة النهائية.\n"
+        "• الإعلانات داخل **مدينة الرياض** فقط.\n"
+        "• يجب كتابة **رقم الرخصة العقارية (FAL)** في كل إعلان.\n"
+        "• يمنع الإعلان عن خدمات غير عقارية. المخالفات تُحذف ويُطبق الحظر المؤقت.\n\n"
+        "Penalties:\n"
+        "1st off-topic: 24h ban  •  2nd: 3 days  •  3rd: 7 days  •  further: +7 days each.\n"
+        "تذكير: توجد **رسوم 1%** من الأرباح لصاحب الصفحة."
+    )
+    target = int(GROUP_ID) if GROUP_ID else update.effective_chat.id
+    msg = await context.bot.send_message(chat_id=target, text=policy, parse_mode=ParseMode.MARKDOWN)
+    try:
+        await context.bot.pin_chat_message(chat_id=target, message_id=msg.message_id, disable_notification=True)
+        await update.message.reply_text("Policy posted & pinned ✅")
+    except Exception as e:
+        await update.message.reply_text(f"Posted policy, but could not pin: {e}")
+
+REMINDER_TEXT = "تذكير دوري: لصاحب الصفحة أتعاب ثابتة **1%** من أرباح الصفقة."
+
+async def fee_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if GROUP_ID:
+            await context.bot.send_message(chat_id=int(GROUP_ID), text=REMINDER_TEXT, parse_mode=ParseMode.MARKDOWN)
+    except: pass
+
+async def cmd_start_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None or not is_admin(update.effective_user.id):
+        await update.message.reply_text(TXT["only_admin"]); return
+    context.job_queue.run_repeating(fee_reminder_job, interval=6*60*60, first=10)
+    await update.message.reply_text("6-hour fee reminders enabled ✅")
+
+async def cmd_stop_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None or not is_admin(update.effective_user.id):
+        await update.message.reply_text(TXT["only_admin"]); return
+    for job in context.job_queue.jobs(): job.schedule_removal()
+    await update.message.reply_text("Fee reminders stopped ✅")
+
+# ---------------- Wizard (/new) ----------------
+async def start_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(TXT["choose_lang"], reply_markup=lang_keyboard())
+    return C_LANG
+
+async def choose_lang_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    lang = q.data.split(":")[1]
+    context.user_data["lang"] = lang
+    await q.edit_message_text(t(lang,"deal"), reply_markup=deal_keyboard())
+    return C_DEAL
+
+async def pick_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    context.user_data["deal"] = q.data.split(":")[1]
+    lang = context.user_data.get("lang","ar")
+    await q.edit_message_text(t(lang,"type"))
+    return C_TYPE
+
+async def ask_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["ptype"] = (update.message.text or "").strip().lower()
+    lang = context.user_data.get("lang","ar")
+    await update.message.reply_text(t(lang,"district"))
+    return C_DISTRICT
+
+async def ask_district(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["district"] = (update.message.text or "").strip()
+    lang = context.user_data.get("lang","ar")
+    await update.message.reply_text(t(lang,"price"))
+    return C_PRICE
+
+async def ask_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    p = parse_price_int(update.message.text)
+    lang = context.user_data.get("lang","ar")
+    if p is None:
+        await update.message.reply_text(t(lang,"invalid")); return C_PRICE
+    context.user_data["price"] = p
+    await update.message.reply_text(t(lang,"size"))
+    return C_SIZE
+
+async def ask_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = parse_int(update.message.text); lang = context.user_data.get("lang","ar")
+    if n is None: await update.message.reply_text(t(lang,"invalid")); return C_SIZE
+    context.user_data["size"] = n
+    await update.message.reply_text(t(lang,"beds"))
+    return C_BEDS
+
+async def ask_beds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = parse_int(update.message.text); lang = context.user_data.get("lang","ar")
+    if n is None: await update.message.reply_text(t(lang,"invalid")); return C_BEDS
+    context.user_data["beds"] = n
+    await update.message.reply_text(t(lang,"baths"))
+    return C_BATHS
+
+async def ask_baths(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = parse_int(update.message.text); lang = context.user_data.get("lang","ar")
+    if n is None: await update.message.reply_text(t(lang,"invalid")); return C_BATHS
+    context.user_data["baths"] = n
+    await update.message.reply_text(t(lang,"desc"))
+    return C_DESC
+
+async def ask_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["descr"] = (update.message.text or "").strip()
+    lang = context.user_data.get("lang","ar")
+    await update.message.reply_text(t(lang,"contact"))
+    return C_CONTACT
+
+async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = context.user_data.get("lang","ar")
+    context.user_data["contact"] = (update.message.text or "").strip()
+    await update.message.reply_text(t(lang,"license"))
+    return C_LICENSE
+
+async def ask_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = context.user_data.get("lang","ar")
+    digits = clean_digits(update.message.text)
+    if not digits or not (7 <= len(digits) <= 12):
+        await update.message.reply_text(t(lang,"license_invalid")); return C_LICENSE
+    context.user_data["license_no"] = digits
+    kb = ReplyKeyboardMarkup([[KeyboardButton("📍 Send location", request_location=True)]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(t(lang,"location"), reply_markup=kb)
+    return C_LOCATION
+
+async def ask_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = context.user_data.get("lang","ar")
+    if update.message.location:
+        context.user_data["lat"] = update.message.location.latitude
+        context.user_data["lon"] = update.message.location.longitude
+        await update.message.reply_text(t(lang,"saved_loc"))
+    else:
+        if (update.message.text or "").lower() in ("skip","تخطي","سكيب"):
+            await update.message.reply_text(t(lang,"skipped_loc"))
+    context.user_data["photos"] = []
+    await update.message.reply_text(t(lang,"photos"))
+    return C_PHOTOS
+
+async def collect_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = context.user_data.get("lang","ar")
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        photos = context.user_data.get("photos", [])
+        if len(photos) < 10:
+            photos.append(file_id)
+            context.user_data["photos"] = photos
+            await update.message.reply_text(t(lang,"send_more_photos"))
+        else:
+            await update.message.reply_text("Max 10 photos reached.")
+        return C_PHOTOS
+
+    if (update.message.text or "").lower() in ("done","تم","انتهيت"):
+        u = context.user_data
+        async with await db() as conn:
+            await conn.execute(
+                """INSERT INTO listings
+                   (agent_id, language, deal, ptype, district, price, size, beds, baths, descr, contact, license_no, lat, lon, photo_file_ids, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                (
+                    update.effective_user.id, u.get("lang","ar"), u["deal"], u["ptype"], u["district"],
+                    u["price"], u["size"], u["beds"], u["baths"], u["descr"], u["contact"], u["license_no"],
+                    u.get("lat"), u.get("lon"), ",".join(u.get("photos", [])),
+                    datetime.utcnow().isoformat()
+                )
+            )
+            await conn.commit()
+            cur = await conn.execute("SELECT last_insert_rowid()")
+            new_id = (await cur.fetchone())[0]
+        await update.message.reply_text(t(lang,"submitted").format(id=new_id))
+        try:
+            await context.bot.send_message(chat_id=ADMIN_USER, text=f"🧾 New listing pending: ID #{new_id}")
+        except: pass
+        return ConversationHandler.END
+
+    return C_PHOTOS
+
+# ---------------- Listing utilities ----------------
+async def cmd_my_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    async with await db() as conn:
+        cur = await conn.execute(
+            "SELECT id, status, deal, ptype, district, price FROM listings WHERE agent_id=? ORDER BY id DESC LIMIT 12", (uid,)
+        )
+        rows = await cur.fetchall()
+    if not rows:
+        await update.message.reply_text("You have no listings yet. Use /new")
+        return
+    lines = ["Your recent listings:"]
+    for r in rows:
+        lines.append(f"#{r[0]} — {r[2]}/{r[3]} • {r[4]} • SAR {r[5]:,} • {r[1]}")
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args) if context.args else ""
+    if not text:
+        await update.message.reply_text(TXT["search_intro"]); return
+    parts = text.split()
+    deal = parts[0].lower() if parts else ""
+    pr_min, pr_max, district_kw = None, None, None
+    if len(parts) >= 2 and "-" in parts[1]:
+        a, b = parts[1].split("-", 1)
+        pr_min = parse_price_int(a); pr_max = parse_price_int(b)
+    if len(parts) >= 3:
+        district_kw = " ".join(parts[2:])
+    q = "SELECT id, deal, ptype, district, price, size, beds, baths FROM listings WHERE status='approved'"
+    params: List[Any] = []
+    if deal in ("sale","rent"): q += " AND deal=?"; params.append(deal)
+    if pr_min is not None: q += " AND price>=?"; params.append(pr_min)
+    if pr_max is not None: q += " AND price<=?"; params.append(pr_max)
+    if district_kw: q += " AND district LIKE ?"; params.append(f"%{district_kw}%")
+    q += " ORDER BY id DESC LIMIT 10"
+    async with await db() as conn:
+        cur = await conn.execute(q, params); rows = await cur.fetchall()
+    if not rows:
+        await update.message.reply_text("No matches.")
+        return
+    lines = ["Top matches:"]
+    for r in rows:
+        lines.append(f"#{r[0]} • {r[1]}/{r[2]} • {r[3]} • SAR {r[4]:,} • {r[6]}BR/{r[7]}BA • {r[5]} m²")
+    await update.message.reply_text("\n".join(lines))
+
+# ---------------- Admin review ----------------
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(TXT["only_admin"]); return
+    async with await db() as conn:
+        cur = await conn.execute(
+            "SELECT id, agent_id, deal, ptype, district, price FROM listings WHERE status='pending' ORDER BY id ASC LIMIT 20"
+        )
+        rows = await cur.fetchall()
+    if not rows:
+        await update.message.reply_text(TXT["pending_none"]); return
+    lines = ["Pending IDs:"]
+    for r in rows:
+        lines.append(f"#{r[0]} • {r[2]}/{r[3]} • {r[4]} • SAR {r[5]:,} • agent {r[1]}")
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(TXT["only_admin"]); return
+    parts = (update.message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await update.message.reply_text("Usage: /approve <ID>"); return
+    lid = int(parts[1])
+    async with await db() as conn:
+        cur = await conn.execute("SELECT * FROM listings WHERE id=?", (lid,))
+        row = await cur.fetchone()
+        if not row:
+            await update.message.reply_text("Not found."); return
+        cols = [d[0] for d in cur.description]; data = dict(zip(cols, row))
+        if data["status"] == "approved":
+            await update.message.reply_text("Already approved."); return
+        photos = [p for p in (data["photo_file_ids"] or "").split(",") if p]
+        caption = listing_caption(data)
+        if CHANNEL_ID:
+            if photos:
+                media = [InputMediaPhoto(media=pf, caption=caption if i==0 else None) for i, pf in enumerate(photos[:10])]
+                await context.bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+            else:
+                await context.bot.send_message(chat_id=CHANNEL_ID, text=caption)
+        await conn.execute("UPDATE listings SET status='approved' WHERE id=?", (lid,))
+        await conn.commit()
+    await update.message.reply_text(f"Approved listing #{lid} ✅")
+    try:
+        await context.bot.send_message(chat_id=data["agent_id"], text=TXT["approved_user"])
+    except: pass
+
+async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(TXT["only_admin"]); return
+    parts = (update.message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await update.message.reply_text("Usage: /reject <ID> [reason]"); return
+    lid = int(parts[1]); reason = parts[2] if len(parts)>=3 else "Not specified"
+    async with await db() as conn:
+        await conn.execute("UPDATE listings SET status='rejected' WHERE id=?", (lid,))
+        await conn.commit()
+    await update.message.reply_text(f"Rejected listing #{lid} ❌")
+    try:
+        async with await db() as conn:
+            cur = await conn.execute("SELECT agent_id FROM listings WHERE id=?", (lid,))
+            r = await cur.fetchone()
+        if r:
+            await context.bot.send_message(chat_id=r[0], text=TXT["rejected_user"]["en"].format(reason=reason))
+    except: pass
+
+# ---------------- Moderation in group ----------------
+async def ban_record(user_id: int, reason: str) -> int:
+    async with await db() as conn:
+        cur = await conn.execute("SELECT count FROM offenses WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        if row:
+            newc = row[0] + 1
+            await conn.execute("UPDATE offenses SET count=?, last_reason=?, updated_at=? WHERE user_id=?",
+                               (newc, reason, datetime.utcnow().isoformat(), user_id))
+        else:
+            newc = 1
+            await conn.execute("INSERT INTO offenses (user_id, count, last_reason, updated_at) VALUES (?,?,?,?)",
+                               (user_id, 1, reason, datetime.utcnow().isoformat()))
+        await conn.commit()
+    return newc
+
+def ban_seconds(count: int) -> int:
+    if count == 1: return 24*3600
+    if count == 2: return 3*24*3600
+    if count == 3: return 7*24*3600
+    return (7 + 7*(count-3)) * 24*3600
+
+async def moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    # Only moderate the configured group (if provided)
+    if GROUP_ID and str(update.effective_chat.id) != str(GROUP_ID):
+        return
+    if msg.from_user and is_admin(msg.from_user.id):
+        return
+
+    text = msg.text or msg.caption or ""
+    has_loc = bool(msg.location)
+    outside_riyadh = False
+    if has_loc:
+        d_km = haversine_km(msg.location.latitude, msg.location.longitude, *RIYADH_CENTER)
+        outside_riyadh = d_km > RIYADH_RADIUS_KM
+    if mentions_non_riyadh_city(text):
+        outside_riyadh = True
+
+    missing_license = not contains_license(text)
+    offtopic = looks_offtopic(text)
+
+    reason = None
+    if offtopic:
+        reason = "off-topic"
+    elif outside_riyadh:
+        reason = "outside-riyadh"
+    elif missing_license:
+        reason = "no-license"
+
+    if reason:
+        try: await msg.delete()
+        except: pass
+
+        if reason in ("off-topic","outside-riyadh"):
+            count = await ban_record(msg.from_user.id, reason)
+            seconds = ban_seconds(count)
+            until = datetime.utcnow() + timedelta(seconds=seconds)
+            try:
+                await context.bot.ban_chat_member(chat_id=update.effective_chat.id, user_id=msg.from_user.id, until_date=until)
+            except: pass
+            try:
+                await context.bot.send_message(
+                    chat_id=msg.from_user.id,
+                    text=(
+                        "تم حذف إعلانك وحظرك مؤقتًا بسبب: "
+                        f"{'إعلانات خدمات غير عقارية' if reason=='off-topic' else 'إعلان خارج الرياض'}.\n"
+                        f"مدة الحظر: {seconds//3600} ساعة.\n"
+                        "الرجاء الالتزام: الرياض فقط + عقار فقط + رقم الرخصة FAL."
+                    )
+                )
+            except: pass
+        else:
+            try:
+                await context.bot.send_message(
+                    chat_id=msg.from_user.id,
+                    text="تم حذف إعلانك لعدم وجود رقم الرخصة العقارية (FAL). الرجاء إعادة النشر مع كتابة رقم الرخصة."
+                )
+            except: pass
+
+# ---------------- App wiring ----------------
+def app():
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # General commands
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("whereami", cmd_whereami))
+    application.add_handler(CommandHandler("pin_policy", cmd_pin_policy))
+    application.add_handler(CommandHandler("start_reminders", cmd_start_reminders))
+    application.add_handler(CommandHandler("stop_reminders", cmd_stop_reminders))
+    application.add_handler(CommandHandler("my_listings", cmd_my_listings))
+    application.add_handler(CommandHandler("search", cmd_search))
+    application.add_handler(CommandHandler("pending", cmd_pending))
+    application.add_handler(CommandHandler("approve", cmd_approve))
+    application.add_handler(CommandHandler("reject", cmd_reject))
+
+    # /new conversation (in DM with bot)
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("new", start_conv)],
+        states={
+            C_LANG: [CallbackQueryHandler(choose_lang_cb, pattern=r"^lang:")],
+            C_DEAL: [CallbackQueryHandler(pick_deal, pattern=r"^deal:")],
+            C_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_type)],
+            C_DISTRICT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_district)],
+            C_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_price)],
+            C_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_size)],
+            C_BEDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_beds)],
+            C_BATHS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_baths)],
+            C_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_desc)],
+            C_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_contact)],
+            C_LICENSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_license)],
+            C_LOCATION: [MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, ask_location)],
+            C_PHOTOS: [MessageHandler((filters.PHOTO | filters.TEXT) & ~filters.COMMAND, collect_photos)],
+        },
+        fallbacks=[CommandHandler("start", cmd_start)],
+        allow_reentry=True
+    )
+    application.add_handler(conv)
+
+    # Group moderation
+    application.add_handler(MessageHandler(filters.ALL & filters.ChatType.GROUPS, moderation))
+
+    return application
+
+async def main_async():
+    await init_db()
+    application = app()
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
+    await application.stop()  # never reached
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(init_db())
+    application = app()
+    application.run_polling(drop_pending_updates=True)
